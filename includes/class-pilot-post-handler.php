@@ -1,286 +1,267 @@
+```php
 <?php
 /**
- * Creates, updates, and trashes WordPress posts from Pilot WMS webhook payloads.
+ * Creates, updates, and unpublishes Jetonomy posts from Pilot WMS webhook payloads.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
-	exit;
+    exit;
 }
 
 class Pilot_Post_Handler {
 
-	/** @var Pilot_Image_Handler */
-	private $image_handler;
+    /** @var Pilot_Image_Handler */
+    private $image_handler;
 
-	public function __construct( Pilot_Image_Handler $image_handler ) {
-		$this->image_handler = $image_handler;
-	}
+    public function __construct( Pilot_Image_Handler $image_handler ) {
+        $this->image_handler = $image_handler;
+    }
 
-	/**
-	 * Handle content.published event.
-	 *
-	 * @param array $payload Full webhook payload.
-	 * @return WP_REST_Response|WP_Error
-	 */
-	public function handle_publish( array $payload ) {
-		$content = $payload['content'] ?? array();
-		$projection_id = sanitize_text_field( $content['projection_id'] ?? '' );
+    /**
+     * Handle content.published event.
+     *
+     * @param array $payload Full webhook payload.
+     * @return WP_REST_Response|WP_Error
+     */
+    public function handle_publish( array $payload ) {
+        $content = $payload['content'] ?? [];
+        $projection_id = sanitize_text_field( $content['projection_id'] ?? '' );
 
-		if ( empty( $projection_id ) ) {
-			return new WP_Error( 'pilot_wms_missing_id', 'Missing projection_id.', array( 'status' => 400 ) );
-		}
+        if ( empty( $projection_id ) ) {
+            return new WP_Error( 'pilot_wms_missing_id', 'Missing projection_id.', [ 'status' => 400 ] );
+        }
 
-		// Idempotency: if a post with this projection_id already exists, delegate to update.
-		$existing = $this->find_post_by_projection_id( $projection_id );
-		if ( $existing ) {
-			$payload['content']['external_id'] = (string) $existing;
-			return $this->handle_update( $payload );
-		}
+        // Idempotency: if already exists, delegate to update
+        $existing = $this->find_jetonomy_post_by_projection_id( $projection_id );
+        if ( $existing ) {
+            $payload['content']['external_id'] = (string) $existing;
+            return $this->handle_update( $payload );
+        }
 
-		$author_id = $this->get_or_create_staff_user();
-		$category_id = $this->resolve_category( $content );
+        // Determine space ID from topic_region
+        $region_slug = $content['metadata']['topic_region'] ?? get_option( 'pilot_wms_default_region', 'general' );
+        $space_id = pilot_find_or_create_jetonomy_space( $region_slug );
+        if ( ! $space_id ) {
+            return new WP_Error( 'pilot_wms_space_error', 'Could not find or create Jetonomy space.', [ 'status' => 500 ] );
+        }
 
-		$post_data = array(
-			'post_title'    => sanitize_text_field( $content['title'] ?? '' ),
-			'post_name'     => sanitize_title( $content['slug'] ?? '' ),
-			'post_content'  => wp_kses_post( $content['body'] ?? '' ),
-			'post_excerpt'  => sanitize_text_field( $content['summary'] ?? '' ),
-			'post_status'   => get_option( 'pilot_wms_post_status', 'draft' ),
-			'post_author'   => $author_id,
-			'post_category' => array( $category_id ),
-		);
+        // Map WordPress author to Jetonomy user
+        $staff_wp_id = $this->get_or_create_staff_user();
+        $jetonomy_author_id = pilot_get_jetonomy_user_id( $staff_wp_id );
+        if ( ! $jetonomy_author_id ) {
+            $jetonomy_author_id = 1; // fallback to admin
+        }
 
-		$post_id = wp_insert_post( $post_data, true );
+        // Prepare Jetonomy post data
+        $post_data = [
+            'title'       => sanitize_text_field( $content['title'] ?? '' ),
+            'content'     => wp_kses_post( $content['body'] ?? '' ),
+            'space_id'    => $space_id,
+            'excerpt'     => sanitize_text_field( $content['summary'] ?? '' ),
+            'author_id'   => $jetonomy_author_id,
+            'status'      => get_option( 'pilot_wms_post_status', 'draft' ),
+        ];
 
-		if ( is_wp_error( $post_id ) ) {
-			return new WP_Error(
-				'pilot_wms_insert_failed',
-				$post_id->get_error_message(),
-				array( 'status' => 500 )
-			);
-		}
+        // Call Jetonomy API to create the post
+        $result = pilot_call_jetonomy_api( '/posts', 'POST', $post_data );
 
-		// Marker tag.
-		$tag = get_option( 'pilot_wms_tag', PILOT_WMS_TAG );
-		wp_set_post_tags( $post_id, array( $tag ), true );
+        if ( ! $result || empty( $result['id'] ) ) {
+            return new WP_Error( 'pilot_wms_jetonomy_failed', 'Jetonomy post creation failed.', [ 'status' => 500 ] );
+        }
 
-		// Post meta.
-		$this->save_meta( $post_id, $content, $payload );
+        $jetonomy_post_id = $result['id'];
 
-		// Featured image.
-		$this->maybe_sideload_image( $post_id, $content );
+        // Store Pilot metadata as WordPress post meta (using a hidden "shadow" post)
+        $shadow_post_id = $this->store_shadow_post( $content, $payload, $jetonomy_post_id );
 
-		return new WP_REST_Response( array(
-			'status'       => 'ok',
-			'external_id'  => (string) $post_id,
-			'external_url' => get_permalink( $post_id ),
-		), 200 );
-	}
+        // Handle featured image if present
+        if ( ! empty( $content['image_url'] ) ) {
+            $this->maybe_attach_image_to_jetonomy_post( $jetonomy_post_id, $content['image_url'], $content['image_alt'] ?? '' );
+        }
 
-	/**
-	 * Handle content.updated event.
-	 *
-	 * @param array $payload Full webhook payload.
-	 * @return WP_REST_Response|WP_Error
-	 */
-	public function handle_update( array $payload ) {
-		$content = $payload['content'] ?? array();
-		$post_id = $this->resolve_post_id( $content );
+        return new WP_REST_Response( [
+            'status'       => 'ok',
+            'external_id'  => (string) $jetonomy_post_id,
+            'external_url' => $result['permalink'] ?? '',
+        ], 200 );
+    }
 
-		if ( ! $post_id ) {
-			return new WP_Error( 'pilot_wms_not_found', 'Post not found.', array( 'status' => 404 ) );
-		}
+    /**
+     * Handle content.updated event.
+     *
+     * @param array $payload Full webhook payload.
+     * @return WP_REST_Response|WP_Error
+     */
+    public function handle_update( array $payload ) {
+        $content = $payload['content'] ?? [];
+        $jetonomy_post_id = $this->resolve_jetonomy_post_id( $content );
 
-		$update_data = array(
-			'ID'           => $post_id,
-			'post_title'   => sanitize_text_field( $content['title'] ?? '' ),
-			'post_name'    => sanitize_title( $content['slug'] ?? '' ),
-			'post_content' => wp_kses_post( $content['body'] ?? '' ),
-			'post_excerpt' => sanitize_text_field( $content['summary'] ?? '' ),
-		);
+        if ( ! $jetonomy_post_id ) {
+            return new WP_Error( 'pilot_wms_not_found', 'Jetonomy post not found.', [ 'status' => 404 ] );
+        }
 
-		// Re-map category if topic changed.
-		$category_id = $this->resolve_category( $content );
-		$update_data['post_category'] = array( $category_id );
+        $update_data = [
+            'title'   => sanitize_text_field( $content['title'] ?? '' ),
+            'content' => wp_kses_post( $content['body'] ?? '' ),
+            'excerpt' => sanitize_text_field( $content['summary'] ?? '' ),
+        ];
 
-		$result = wp_update_post( $update_data, true );
+        // Update region -> space if changed
+        $region_slug = $content['metadata']['topic_region'] ?? '';
+        if ( $region_slug ) {
+            $space_id = pilot_find_or_create_jetonomy_space( $region_slug );
+            if ( $space_id ) {
+                $update_data['space_id'] = $space_id;
+            }
+        }
 
-		if ( is_wp_error( $result ) ) {
-			return new WP_Error(
-				'pilot_wms_update_failed',
-				$result->get_error_message(),
-				array( 'status' => 500 )
-			);
-		}
+        $result = pilot_call_jetonomy_api( '/posts/' . $jetonomy_post_id, 'PUT', $update_data );
 
-		// Update meta.
-		$this->save_meta( $post_id, $content, $payload );
+        if ( ! $result ) {
+            return new WP_Error( 'pilot_wms_update_failed', 'Jetonomy post update failed.', [ 'status' => 500 ] );
+        }
 
-		// Re-sideload image only if URL changed.
-		$current_image_url = get_post_meta( $post_id, PILOT_WMS_META_PREFIX . 'image_url', true );
-		$new_image_url     = $content['image_url'] ?? '';
-		if ( ! empty( $new_image_url ) && $new_image_url !== $current_image_url ) {
-			$this->maybe_sideload_image( $post_id, $content );
-		}
+        // Update shadow post meta
+        $this->update_shadow_post( $jetonomy_post_id, $content, $payload );
 
-		return new WP_REST_Response( array(
-			'status'       => 'ok',
-			'external_id'  => (string) $post_id,
-			'external_url' => get_permalink( $post_id ),
-		), 200 );
-	}
+        // Update image if URL changed
+        $current_image = get_post_meta( $this->get_shadow_post_id( $jetonomy_post_id ), '_pilot_image_url', true );
+        $new_image_url = $content['image_url'] ?? '';
+        if ( ! empty( $new_image_url ) && $new_image_url !== $current_image ) {
+            $this->maybe_attach_image_to_jetonomy_post( $jetonomy_post_id, $new_image_url, $content['image_alt'] ?? '' );
+        }
 
-	/**
-	 * Handle content.unpublished event.
-	 *
-	 * @param array $payload Full webhook payload.
-	 * @return WP_REST_Response|WP_Error
-	 */
-	public function handle_unpublish( array $payload ) {
-		$content = $payload['content'] ?? array();
-		$post_id = $this->resolve_post_id( $content );
+        return new WP_REST_Response( [
+            'status'       => 'ok',
+            'external_id'  => (string) $jetonomy_post_id,
+            'external_url' => $result['permalink'] ?? '',
+        ], 200 );
+    }
 
-		// Idempotent: if post not found, return success.
-		if ( ! $post_id ) {
-			return new WP_REST_Response( array( 'status' => 'ok' ), 200 );
-		}
+    /**
+     * Handle content.unpublished event.
+     *
+     * @param array $payload Full webhook payload.
+     * @return WP_REST_Response|WP_Error
+     */
+    public function handle_unpublish( array $payload ) {
+        $content = $payload['content'] ?? [];
+        $jetonomy_post_id = $this->resolve_jetonomy_post_id( $content );
 
-		wp_update_post( array(
-			'ID'          => $post_id,
-			'post_status' => 'draft',
-		) );
+        if ( ! $jetonomy_post_id ) {
+            // Idempotent: already gone
+            return new WP_REST_Response( [ 'status' => 'ok' ], 200 );
+        }
 
-		return new WP_REST_Response( array(
-			'status'      => 'ok',
-			'external_id' => (string) $post_id,
-		), 200 );
-	}
+        $result = pilot_call_jetonomy_api( '/posts/' . $jetonomy_post_id, 'PUT', [ 'status' => 'draft' ] );
 
-	// -------------------------------------------------------------------------
-	// Private helpers
-	// -------------------------------------------------------------------------
+        return new WP_REST_Response( [ 'status' => 'ok', 'external_id' => (string) $jetonomy_post_id ], 200 );
+    }
 
-	/**
-	 * Find a WP post by _pilot_projection_id meta.
-	 *
-	 * @param string $projection_id
-	 * @return int|null Post ID or null.
-	 */
-	private function find_post_by_projection_id( string $projection_id ) {
-		$posts = get_posts( array(
-			'post_type'      => 'post',
-			'post_status'    => 'any',
-			'meta_key'       => PILOT_WMS_META_PREFIX . 'projection_id',
-			'meta_value'     => $projection_id,
-			'posts_per_page' => 1,
-			'fields'         => 'ids',
-		) );
+    // -------------------------------------------------------------------------
+    // Private helpers for shadow posts (store Pilot metadata in wp_posts)
+    // -------------------------------------------------------------------------
 
-		return ! empty( $posts ) ? (int) $posts[0] : null;
-	}
+    private function find_jetonomy_post_by_projection_id( string $projection_id ) {
+        $shadow = get_posts( [
+            'post_type'      => 'pilot_shadow',
+            'post_status'    => 'any',
+            'meta_key'       => '_pilot_projection_id',
+            'meta_value'     => $projection_id,
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+        ] );
+        if ( empty( $shadow ) ) {
+            return null;
+        }
+        return (int) get_post_meta( $shadow[0], '_jetonomy_post_id', true );
+    }
 
-	/**
-	 * Resolve WP post ID from payload: try external_id first, then projection_id meta.
-	 *
-	 * @param array $content The content portion of the payload.
-	 * @return int|null
-	 */
-	private function resolve_post_id( array $content ) {
-		// Try external_id (the WP post ID we returned earlier).
-		if ( ! empty( $content['external_id'] ) ) {
-			$post_id = (int) $content['external_id'];
-			if ( get_post( $post_id ) ) {
-				return $post_id;
-			}
-		}
+    private function store_shadow_post( $content, $payload, $jetonomy_post_id ) {
+        $shadow_id = wp_insert_post( [
+            'post_title'  => sanitize_text_field( $content['title'] ?? 'Pilot Shadow' ),
+            'post_type'   => 'pilot_shadow',
+            'post_status' => 'private',
+            'meta_input'  => [
+                '_pilot_projection_id'   => sanitize_text_field( $content['projection_id'] ?? '' ),
+                '_pilot_delivery_id'     => sanitize_text_field( $payload['delivery_id'] ?? '' ),
+                '_pilot_tenant_id'       => sanitize_text_field( $payload['tenant']['id'] ?? '' ),
+                '_pilot_source_artifact_ids' => wp_json_encode( array_column( $content['source_artifacts'] ?? [], 'id' ) ),
+                '_pilot_image_url'       => sanitize_url( $content['image_url'] ?? '' ),
+                '_jetonomy_post_id'      => $jetonomy_post_id,
+            ],
+        ] );
+        return $shadow_id;
+    }
 
-		// Fallback: look up by projection_id meta.
-		$projection_id = $content['projection_id'] ?? '';
-		if ( ! empty( $projection_id ) ) {
-			return $this->find_post_by_projection_id( $projection_id );
-		}
+    private function get_shadow_post_id( $jetonomy_post_id ) {
+        $shadows = get_posts( [
+            'post_type'      => 'pilot_shadow',
+            'meta_key'       => '_jetonomy_post_id',
+            'meta_value'     => $jetonomy_post_id,
+            'fields'         => 'ids',
+            'posts_per_page' => 1,
+        ] );
+        return $shadows[0] ?? 0;
+    }
 
-		return null;
-	}
+    private function update_shadow_post( $jetonomy_post_id, $content, $payload ) {
+        $shadow_id = $this->get_shadow_post_id( $jetonomy_post_id );
+        if ( ! $shadow_id ) {
+            return;
+        }
+        update_post_meta( $shadow_id, '_pilot_projection_id', sanitize_text_field( $content['projection_id'] ?? '' ) );
+        update_post_meta( $shadow_id, '_pilot_delivery_id', sanitize_text_field( $payload['delivery_id'] ?? '' ) );
+        update_post_meta( $shadow_id, '_pilot_image_url', sanitize_url( $content['image_url'] ?? '' ) );
+    }
 
-	/**
-	 * Get or create the pilot-staff author user.
-	 *
-	 * @return int User ID.
-	 */
-	private function get_or_create_staff_user(): int {
-		$user = get_user_by( 'login', 'pilot-staff' );
-		if ( $user ) {
-			return $user->ID;
-		}
+    private function resolve_jetonomy_post_id( $content ) {
+        // First try external_id (Jetonomy post ID stored from publish)
+        if ( ! empty( $content['external_id'] ) ) {
+            $pid = (int) $content['external_id'];
+            // Verify it exists in Jetonomy via API
+            $check = pilot_call_jetonomy_api( '/posts/' . $pid, 'GET' );
+            if ( $check && isset( $check['id'] ) ) {
+                return $pid;
+            }
+        }
+        // Fallback: look up by projection_id
+        $projection_id = $content['projection_id'] ?? '';
+        if ( $projection_id ) {
+            return $this->find_jetonomy_post_by_projection_id( $projection_id );
+        }
+        return null;
+    }
 
-		$user_id = wp_insert_user( array(
-			'user_login'   => 'pilot-staff',
-			'user_pass'    => wp_generate_password( 32, true, true ),
-			'user_email'   => 'pilot-staff@localhost',
-			'display_name' => 'Staff',
-			'role'         => 'author',
-		) );
+    private function get_or_create_staff_user(): int {
+        $user = get_user_by( 'login', 'pilot-staff' );
+        if ( $user ) {
+            return $user->ID;
+        }
+        $user_id = wp_insert_user( [
+            'user_login'   => 'pilot-staff',
+            'user_pass'    => wp_generate_password( 32, true, true ),
+            'user_email'   => 'pilot-staff@' . wp_parse_url( home_url(), PHP_URL_HOST ),
+            'display_name' => 'Pilot Staff',
+            'role'         => 'author',
+        ] );
+        return is_wp_error( $user_id ) ? 1 : $user_id;
+    }
 
-		return is_wp_error( $user_id ) ? 1 : $user_id;
-	}
+    private function maybe_attach_image_to_jetonomy_post( $jetonomy_post_id, $image_url, $alt_text ) {
+        // Sideload image into WP media library
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
 
-	/**
-	 * Resolve a WP category ID from payload metadata.
-	 *
-	 * Tries to match metadata.topic_region as a category slug, falls back to configured default.
-	 *
-	 * @param array $content
-	 * @return int Category ID.
-	 */
-	private function resolve_category( array $content ): int {
-		$default = (int) get_option( 'pilot_wms_default_category', 1 );
-		$metadata = $content['metadata'] ?? array();
-
-		if ( ! empty( $metadata['topic_region'] ) ) {
-			$slug = sanitize_title( $metadata['topic_region'] );
-			$term = get_term_by( 'slug', $slug, 'category' );
-			if ( $term && ! is_wp_error( $term ) ) {
-				return (int) $term->term_id;
-			}
-		}
-
-		return $default;
-	}
-
-	/**
-	 * Save Pilot-specific post meta.
-	 *
-	 * @param int   $post_id
-	 * @param array $content
-	 * @param array $payload
-	 */
-	private function save_meta( int $post_id, array $content, array $payload ) {
-		$prefix = PILOT_WMS_META_PREFIX;
-
-		update_post_meta( $post_id, $prefix . 'projection_id', sanitize_text_field( $content['projection_id'] ?? '' ) );
-		update_post_meta( $post_id, $prefix . 'delivery_id', sanitize_text_field( $payload['delivery_id'] ?? '' ) );
-		update_post_meta( $post_id, $prefix . 'tenant_id', sanitize_text_field( $payload['tenant']['id'] ?? '' ) );
-
-		$source_ids = array_map( function ( $a ) {
-			return sanitize_text_field( $a['id'] ?? '' );
-		}, $content['source_artifacts'] ?? array() );
-		update_post_meta( $post_id, $prefix . 'source_artifact_ids', $source_ids );
-	}
-
-	/**
-	 * Sideload featured image if image_url is present.
-	 *
-	 * @param int   $post_id
-	 * @param array $content
-	 */
-	private function maybe_sideload_image( int $post_id, array $content ) {
-		$image_url = $content['image_url'] ?? '';
-		if ( empty( $image_url ) ) {
-			return;
-		}
-
-		$alt = sanitize_text_field( $content['image_alt'] ?? $content['title'] ?? '' );
-		$this->image_handler->sideload( $image_url, $alt, $post_id );
-	}
+        $attachment_id = media_sideload_image( $image_url, 0, $alt_text, 'id' );
+        if ( is_wp_error( $attachment_id ) ) {
+            error_log( 'Image sideload failed: ' . $attachment_id->get_error_message() );
+            return;
+        }
+        // Attach to Jetonomy post via API
+        pilot_call_jetonomy_api( '/posts/' . $jetonomy_post_id . '/featured_image', 'PUT', [ 'image_id' => $attachment_id ] );
+        update_post_meta( $this->get_shadow_post_id( $jetonomy_post_id ), '_pilot_image_url', $image_url );
+    }
 }
+```
