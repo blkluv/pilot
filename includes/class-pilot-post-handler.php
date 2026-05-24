@@ -1,4 +1,3 @@
-```php
 <?php
 /**
  * Creates, updates, and unpublishes Jetonomy posts from Pilot WMS webhook payloads.
@@ -264,4 +263,3 @@ class Pilot_Post_Handler {
         update_post_meta( $this->get_shadow_post_id( $jetonomy_post_id ), '_pilot_image_url', $image_url );
     }
 }
-```
